@@ -155,16 +155,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
-def main():
+async def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("help", cmd_help))
     logger.info("Бот запущено...")
-    app.run_polling(drop_pending_updates=True)
+    async with app:
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        await app.updater.idle()
+        await app.stop()
 
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
-    
