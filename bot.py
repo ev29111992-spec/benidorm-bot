@@ -3,6 +3,8 @@ import re
 import json
 import logging
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from telegram.constants import ParseMode
@@ -13,6 +15,23 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 PINNED_MSG_ID_FILE = "pinned_msg_id.json"
+PORT = int(os.environ.get("PORT", 8080))
+
+# ── Простий веб-сервер щоб Render не вбивав процес ───────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass  # вимикаємо логи HTTP
+
+def run_web_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
+
+# ── Зберігання стану ──────────────────────────────────────────────────────────
 
 def load_state() -> dict:
     if os.path.exists(PINNED_MSG_ID_FILE):
@@ -59,7 +78,6 @@ async def update_pinned(bot: Bot, state: dict):
             return
         except Exception as e:
             logger.warning(f"Не вдалось відредагувати: {e}")
-
     msg = await bot.send_message(
         chat_id=CHANNEL_ID,
         text=text,
@@ -105,7 +123,7 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     save_state(state)
     await update_pinned(context.bot, state)
-    await update.message.reply_text(f"✅ Об'єкт #{post_num} видалено. Список оновлено ({after} об'єктів).")
+    await update.message.reply_text(f"✅ Об'єкт #{post_num} видалено. ({after} об'єктів).")
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
@@ -124,16 +142,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def main():
+    # Запускаємо веб-сервер у окремому потоці
+    t = threading.Thread(target=run_web_server, daemon=True)
+    t.start()
+    logger.info(f"Веб-сервер запущено на порту {PORT}")
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("help", cmd_help))
-    logger.info("Бот запущено...")
+
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Polling started, waiting...")
+    logger.info("Бот запущено!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
