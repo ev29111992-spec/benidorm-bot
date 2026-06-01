@@ -162,12 +162,12 @@ async def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("help", cmd_help))
     logger.info("Бот запущено...")
-    async with app:
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        await app.updater.idle()
-        await app.stop()
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 if __name__ == "__main__":
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    main()
     import asyncio
     asyncio.run(main())
