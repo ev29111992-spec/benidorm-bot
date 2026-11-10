@@ -321,21 +321,54 @@ DEFAULT_TEMPLATE = """🏡 ОРЕНДА НА 11 МІСЯЦІВ | АПАРТАМ�
 
 РОЗТАШУВАННЯ:
 Відстань до моря — 800 м
-Відстань до аеропорту Alicante — 45 км
+Відстань до аеропорту Alicante — 45 км"""
 
-📞 Контакти для звʼязку:
-📱 Телефон: +34684735652
-💬WhatsApp: Olena_Benidorm
-✈️ Telegram: @Olena_Benidorm
-📸 Instagram:benidorm_rent_sale
+# Блок контактів бот додає сам (з посиланнями), модель його не пише
+FOOTER_HTML = (
+    "📞 Контакти для звʼязку:\n"
+    "📱 Телефон: +34684735652\n"
+    '💬WhatsApp: <a href="https://wa.me/34684735652">Olena_Benidorm</a>\n'
+    "✈️ Telegram: @Olena_Benidorm\n"
+    '📸 Instagram:<a href="https://www.instagram.com/benidorm_rent_sale?igsh=MXBxZDJhZG90NWg2MQ==">benidorm_rent_sale</a>\n'
+    "\n"
+    "Більше об'єктів в каналі: https://t.me/benidorm_rent_sale"
+)
+FOOTER_PLAIN = re.sub(r"<[^>]+>", "", FOOTER_HTML)
 
-Більше об'єктів в каналі: https://t.me/benidorm_rent_sale"""
+# Приклад від Олени: як вона отримує оголошення і як має вийти
+EXAMPLE_SOURCE = """#Аренда на 11 месяцев
+1к #апартаменты 70м2
+📍#Benidorm 📍#levante
+❗️сводна с 15.12.2026❗️
+Цена: 1100€ + коммунальные платежи
+Комнаты: 1 спальня;
+Сан узел:1;
+Мебель , техника ✔️
+Кухня-гостиная с выходом на закрытую, просторную террасу ✔️
+Урбанизация: закрытая, зеленая территория, бассейн, падел, теннис,детская площадка , тренажерный зал✔️
+Расстояние к морю : 800 м
+Условия:
+Возвратный депозит: 2 месяца;
+Оплата каждый месяц вперед,
+Расстояние от аэропорта Alicante 45 км.
+Для, просмотра объектов бронируй!
+#️⃣ Contactos:
+📞 Teléfono:
+- 📱 +34624122008
+📱 WhatsApp:
+- 💬 http://wa.me/34624122008
+📱 Telegram:
+- ✈️ @Slava_spaen
+📱 Instagram:
+https://www.instagram.com/sudestinoespana
+#benidormbeach #playadelevante #playadeponiente"""
 
 FORMAT_MODEL = os.environ.get("FORMAT_MODEL", "claude-sonnet-5-5")
 
 FORMAT_RULES = """Ти допомагаєш рієлторці Олені з Бенідорма оформлювати оголошення для її Telegram-групи.
 Тобі дають сирий текст оголошення будь-якою мовою (іспанською, англійською, російською, українською тощо).
 Перепиши його УКРАЇНСЬКОЮ точно за структурою зразка нижче.
+Вхідний текст може бути в будь-якому форматі: з хештегами, списками, крапками з комою, різним порядком полів, з помилками. Результат — ЗАВЖДИ за шаблоном Олени, незалежно від того, як виглядав вхідний текст.
 
 Правила:
 - Структура, емодзі, порядок блоків і ВЕЛИКІ ЛІТЕРИ в заголовках — як у зразку.
@@ -344,12 +377,25 @@ FORMAT_RULES = """Ти допомагаєш рієлторці Олені з Б�
 - 💰 Ціна: числа з пробілом між тисячами (1 100 €, 349 000 €). Для оренди — «€ / місяць», і «+ комунальні платежі», якщо комуналка не включена або не сказано, що включена.
 - Рядок «❗️Вільна з …❗️» додавай, лише якщо в джерелі є дата.
 - Використовуй ТІЛЬКИ факти з джерела. Нічого не вигадуй. Якщо даних для рядка чи блоку немає — пропусти його.
-- Депозит, умови, «можна з тваринами» тощо — коротким окремим блоком «УМОВИ:», якщо вони є в джерелі.
+- Умови оплати і депозит (депозит 2 місяці, оплата наперед тощо) НЕ пиши — Олена обговорює їх з клієнтом окремо. Важливі обмеження на кшталт «без тварин» / «можна з тваринами» можна додати рядком у ХАРАКТЕРИСТИКИ.
+- Заклики («бронюйте перегляд»), хештеги, референс-номери — прибирай.
 - Стиль простий і живий, без рекламних слів на кшталт «неймовірний», «розкішний», «унікальна пропозиція».
 - Іспанські терміни можна лишати там, де так природніше (urbanización, trastero, empadronamiento — з українським поясненням у дужках за потреби).
-- Блок контактів наприкінці — ЗАВЖДИ дослівно як у зразку. Чужі телефони, імена агентів, посилання, референс-номери з джерела прибери.
-- Увесь текст — не довше 950 символів.
+- НЕ пиши блок контактів і жодних телефонів, імен агентів, посилань, Instagram/Telegram з джерела — свої контакти бот додасть сам наприкінці. Закінчуй текст блоком РОЗТАШУВАННЯ (або останнім блоком, для якого є дані).
+- Увесь текст — не довше 750 символів.
 - Відповідай ЛИШЕ готовим текстом оголошення, без пояснень."""
+
+
+def text_of(s):
+    return s or ""
+
+
+def with_footer(text: str, as_html: bool) -> str:
+    """Додає блок контактів, якщо його ще нема в тексті."""
+    if "Контакти для зв" in text:
+        return html.escape(text) if as_html else text
+    body = html.escape(text) if as_html else text
+    return body + "\n\n" + (FOOTER_HTML if as_html else FOOTER_PLAIN)
 
 
 def get_api_key(context) -> str:
@@ -365,6 +411,8 @@ async def format_listing(context, raw: str) -> str:
     if not key:
         raise RuntimeError("no_key")
     system = FORMAT_RULES + "\n\nЗРАЗОК ОФОРМЛЕННЯ:\n" + get_template(context)
+    if "Контакти для зв" in text_of(get_template(context)):
+        system += "\n\n(Блок контактів зі зразка не повторюй — його додасть бот.)"
     async with httpx.AsyncClient(timeout=90) as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -377,7 +425,11 @@ async def format_listing(context, raw: str) -> str:
                 "model": FORMAT_MODEL,
                 "max_tokens": 1500,
                 "system": system,
-                "messages": [{"role": "user", "content": "Сирий текст оголошення:\n\n" + raw}],
+                "messages": [
+                    {"role": "user", "content": "Сирий текст оголошення:\n\n" + EXAMPLE_SOURCE},
+                    {"role": "assistant", "content": DEFAULT_TEMPLATE},
+                    {"role": "user", "content": "Сирий текст оголошення:\n\n" + raw},
+                ],
             },
         )
     if r.status_code != 200:
@@ -469,7 +521,10 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
             logger.warning("format: %s", e)
 
     if draft.get("final"):
-        pv = await context.bot.send_message(job.chat_id, draft["final"], disable_web_page_preview=True)
+        pv = await context.bot.send_message(
+            job.chat_id, with_footer(draft["final"], as_html=True),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
         draft["preview_id"] = pv.message_id
 
     n_photo = sum(1 for t, _ in draft["media"] if t == "photo")
@@ -492,7 +547,8 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
         lines.append("У список піде: <b>" + html.escape(item_label(parsed)) + "</b>")
     else:
         lines.append("⚠️ Не знайшла ціну в тексті — опублікую, але в список не додам")
-    if draft["media"] and len(draft.get("final") or draft["plain"]) > CAPTION_LIMIT:
+    final_len = len(with_footer(draft["final"], False)) if draft.get("final") else len(draft["plain"])
+    if draft["media"] and final_len > CAPTION_LIMIT:
         lines.append("ℹ️ Текст довгий для підпису до фото, тож опублікую його окремим повідомленням під фото")
     lines.append("")
     lines.append("Можна ще докинути фото або текст — я оновлю чернетку.")
@@ -516,8 +572,8 @@ async def publish_draft(context, draft: dict) -> list:
     """Публікує чернетку в групу. Повертає список надісланих повідомлень."""
     media = draft["media"]
     if draft.get("final") and not draft.get("use_raw"):
-        plain = draft["final"]
-        text_html = html.escape(plain)
+        plain = with_footer(draft["final"], as_html=False)
+        text_html = with_footer(draft["final"], as_html=True)
     else:
         text_html, plain = draft["html"], draft["plain"]
     fits_caption = bool(plain) and len(plain) <= CAPTION_LIMIT
