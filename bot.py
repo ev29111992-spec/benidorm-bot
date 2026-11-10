@@ -33,6 +33,7 @@ import html
 import hashlib
 import logging
 import asyncio
+import time
 
 from aiohttp import web
 import httpx
@@ -495,13 +496,33 @@ async def format_to_fit(context, raw: str) -> str:
 
 # ── Чернетка оголошення ───────────────────────────────────────────────────────
 
+NEW_DRAFT_AFTER_SECONDS = 30  # якщо після показу чернетки пройшло стільки часу і прийшли нові фото — це нове оголошення
+
+
+def new_draft() -> dict:
+    return {"media": [], "seen": set(), "html": "", "plain": "", "prompt_id": None,
+            "preview_ids": [], "last_ts": 0.0}
+
+
 def get_draft(context, user_id) -> dict:
     drafts = context.bot_data.setdefault("drafts", {})
-    return drafts.setdefault(user_id, {"media": [], "html": "", "plain": "", "prompt_id": None})
+    return drafts.setdefault(user_id, new_draft())
 
 
 def drop_draft(context, user_id):
     context.bot_data.setdefault("drafts", {}).pop(user_id, None)
+
+
+async def clear_draft_messages(context, chat_id, draft):
+    ids = list(draft.get("preview_ids") or [])
+    if draft.get("prompt_id"):
+        ids.append(draft["prompt_id"])
+    for mid in ids:
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    draft["preview_ids"], draft["prompt_id"] = [], None
 
 
 async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -514,20 +535,36 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
+    now = time.time()
     draft = get_draft(context, user.id)
+    reply_to = msg.reply_to_message.message_id if msg.reply_to_message else None
+    is_edit_reply = reply_to and (reply_to == draft.get("prompt_id") or reply_to in draft.get("preview_ids", []))
+
+    # Чернетку вже показали, минуло трохи часу, і прийшло щось нове (не правка) — починаємо нове оголошення
+    if draft.get("prompt_id") and not is_edit_reply and now - draft["last_ts"] > NEW_DRAFT_AFTER_SECONDS:
+        await clear_draft_messages(context, msg.chat_id, draft)
+        drop_draft(context, user.id)
+        draft = get_draft(context, user.id)
+    draft["last_ts"] = now
+
     if msg.photo:
-        draft["media"].append(("photo", msg.photo[-1].file_id))
+        uid = msg.photo[-1].file_unique_id
+        if uid not in draft["seen"]:
+            draft["seen"].add(uid)
+            draft["media"].append(("photo", msg.photo[-1].file_id))
     elif msg.video:
-        draft["media"].append(("video", msg.video.file_id))
+        uid = msg.video.file_unique_id
+        if uid not in draft["seen"]:
+            draft["seen"].add(uid)
+            draft["media"].append(("video", msg.video.file_id))
 
     text_html = msg.caption_html if (msg.photo or msg.video) else msg.text_html
     text_plain = msg.caption if (msg.photo or msg.video) else msg.text
-    reply_to = msg.reply_to_message.message_id if msg.reply_to_message else None
-    if text_plain and text_plain.strip() and reply_to and reply_to in (draft.get("prompt_id"), draft.get("preview_id")):
+    if text_plain and text_plain.strip() and is_edit_reply:
         # Олена відповіла на чернетку виправленим текстом — беремо його як є
         draft["final"] = text_plain.strip()
         draft["locked"] = True
-    elif text_plain and text_plain.strip():
+    elif text_plain and text_plain.strip() and text_plain.strip() not in draft["plain"]:
         draft["locked"] = False
         draft["final"] = None
         if draft["plain"]:
@@ -536,7 +573,7 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             draft["html"], draft["plain"] = text_html, text_plain
 
-    # Чекаємо, поки долетять усі фото з альбому, і тоді показуємо підсумок
+    # Чекаємо, поки долетять усі фото з альбому, і тоді показуємо чернетку
     for job in context.job_queue.get_jobs_by_name(f"draft_{user.id}"):
         job.schedule_removal()
     context.job_queue.run_once(
@@ -548,13 +585,7 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     draft = get_draft(context, job.user_id)
-    for key in ("prompt_id", "preview_id"):
-        if draft.get(key):
-            try:
-                await context.bot.delete_message(job.chat_id, draft[key])
-            except Exception:
-                pass
-            draft[key] = None
+    await clear_draft_messages(context, job.chat_id, draft)
 
     format_note = None
     if draft["plain"] and not draft.get("locked") and not draft.get("final"):
@@ -572,27 +603,25 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
             format_note = "⚠️ Не вдалося переписати текст — можна опублікувати оригінал"
             logger.warning("format: %s", e)
 
-    if draft.get("final"):
-        pv = await context.bot.send_message(
-            job.chat_id, with_footer(draft["final"], as_html=True),
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-        )
-        draft["preview_id"] = pv.message_id
+    # Попередній перегляд — точно так, як буде в групі (фото + опис одним постом)
+    if draft["media"] or draft["plain"]:
+        try:
+            sent = await publish_draft(context, draft, chat_id=job.chat_id)
+            draft["preview_ids"] = [m.message_id for m in sent]
+        except Exception as e:
+            logger.warning("preview: %s", e)
 
-    n_photo = sum(1 for t, _ in draft["media"] if t == "photo")
+    n_all = len(draft["media"])
     n_video = sum(1 for t, _ in draft["media"] if t == "video")
     parsed = parse_listing(draft.get("final") or draft["plain"])
-    lines = ["📝 <b>Чернетка оголошення</b>"]
-    if draft.get("final"):
-        lines.append("☝️ Вище — текст, який піде в групу." + (" (ваша версія)" if draft.get("locked") else ""))
+    lines = ["📝 <b>Чернетка</b> ☝️ — так пост виглядатиме в групі" + (" (ваш текст)" if draft.get("locked") else "")]
     if format_note:
         lines.append(format_note)
-    media_bits = []
-    if n_photo:
-        media_bits.append(f"{n_photo} фото")
-    if n_video:
-        media_bits.append(f"{n_video} відео")
-    lines.append("Медіа: " + (", ".join(media_bits) if media_bits else "немає"))
+    if n_all:
+        bits = f"{n_all - n_video} фото" + (f", {n_video} відео" if n_video else "")
+        lines.append("Медіа: " + bits + (" — опублікую перші 10 (ліміт Telegram)" if n_all > 10 else ""))
+    else:
+        lines.append("Медіа: немає — можна докинути фото")
     if not draft["plain"]:
         lines.append("Текст: ще немає — можна докинути наступним повідомленням")
     elif parsed:
@@ -606,28 +635,25 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
             "(ліміт Telegram — 1024). Скоротіть його через «Відповісти», "
             "інакше опис піде окремим повідомленням під фото."
         )
-    if len(draft["media"]) > 10:
-        lines.append(f"ℹ️ Фото {len(draft['media'])}, а в одному пості Telegram дозволяє максимум 10 — опублікую перші 10.")
     lines.append("")
-    lines.append("Можна ще докинути фото або текст — я оновлю чернетку.")
-    if draft.get("final"):
-        lines.append("Щоб виправити текст: натисніть «Відповісти» на повідомлення з текстом і надішліть виправлену версію.")
+    lines.append("Докинути фото чи текст — просто надішліть. Виправити текст — «Відповісти» на фото з описом.")
 
     buttons = [[
         InlineKeyboardButton("✅ Опублікувати", callback_data="publish"),
         InlineKeyboardButton("❌ Скасувати", callback_data="cancel"),
     ]]
-    if draft.get("final"):
+    if draft.get("final") and not draft.get("locked"):
         buttons.append([InlineKeyboardButton("📄 Опублікувати оригінал без змін", callback_data="publish_raw")])
-    kb = InlineKeyboardMarkup(buttons)
     m = await context.bot.send_message(
-        job.chat_id, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb
+        job.chat_id, "\n".join(lines), parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
     draft["prompt_id"] = m.message_id
 
 
-async def publish_draft(context, draft: dict) -> list:
-    """Публікує чернетку в групу. Повертає список надісланих повідомлень."""
+async def publish_draft(context, draft: dict, chat_id=None) -> list:
+    """Надсилає пост (у групу або, для перегляду, в особистий чат). Повертає надіслані повідомлення."""
+    chat_id = chat_id or CHANNEL_ID
     media = draft["media"][:10]  # один пост = один альбом, максимум 10 фото
     if draft.get("final") and not draft.get("use_raw"):
         plain = with_footer(draft["final"], as_html=False)
@@ -641,7 +667,7 @@ async def publish_draft(context, draft: dict) -> list:
         if not plain:
             raise ValueError("Чернетка порожня")
         sent.append(await context.bot.send_message(
-            CHANNEL_ID, text_html, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+            chat_id, text_html, parse_mode=ParseMode.HTML, disable_web_page_preview=True
         ))
         return sent
 
@@ -655,7 +681,7 @@ async def publish_draft(context, draft: dict) -> list:
         kind, fid = media[0]
         send = context.bot.send_photo if kind == "photo" else context.bot.send_video
         sent.append(await send(
-            CHANNEL_ID, fid,
+            chat_id, fid,
             caption=text_html if fits_caption else None,
             parse_mode=ParseMode.HTML if fits_caption else None,
         ))
@@ -664,11 +690,11 @@ async def publish_draft(context, draft: dict) -> list:
             make(k, f, text_html if (i == 0 and fits_caption) else None)
             for i, (k, f) in enumerate(media)
         ]
-        sent.extend(await context.bot.send_media_group(CHANNEL_ID, group))
+        sent.extend(await context.bot.send_media_group(chat_id, group))
 
     if plain and not fits_caption:
         sent.append(await context.bot.send_message(
-            CHANNEL_ID, text_html, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+            chat_id, text_html, parse_mode=ParseMode.HTML, disable_web_page_preview=True
         ))
     return sent
 
@@ -681,19 +707,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     drafts = context.bot_data.setdefault("drafts", {})
     draft = drafts.get(user.id)
+    chat_id = query.message.chat_id
 
     if query.data == "cancel":
+        if draft:
+            await clear_draft_messages(context, chat_id, {"preview_ids": draft.get("preview_ids", [])})
         drop_draft(context, user.id)
         await query.answer("Скасовано")
-        await query.edit_message_text("❌ Чернетку скасовано.")
+        await query.edit_message_text("❌ Чернетку скасовано. Можна надсилати нове оголошення.")
         return
 
     if query.data in ("publish", "publish_raw"):
-        if draft:
-            draft["use_raw"] = query.data == "publish_raw"
         if not draft or (not draft["media"] and not draft["plain"]):
-            await query.answer("Чернетка порожня", show_alert=True)
+            await query.answer("Ця чернетка вже неактуальна", show_alert=True)
             return
+        draft["use_raw"] = query.data == "publish_raw"
         await query.answer("Публікую…")
         drop_draft(context, user.id)  # щоб подвійне натискання не опублікувало двічі
         try:
@@ -710,13 +738,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        await clear_draft_messages(context, chat_id, {"preview_ids": draft.get("preview_ids", [])})
         first_id = sent[0].message_id
         lines = [f'✅ Опубліковано: <a href="{post_url(first_id)}">{post_url(first_id)}</a>']
-        if draft.get("preview_id"):
-            try:
-                await context.bot.delete_message(query.message.chat_id, draft["preview_id"])
-            except Exception:
-                pass
         used = draft["plain"] if draft.get("use_raw") or not draft.get("final") else draft["final"]
         parsed = parse_listing(used)
         if parsed:
@@ -726,6 +750,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append("ℹ️ Закріпленого списку в групі ще нема — створіть його командою /index")
         else:
             lines.append("⚠️ Ціну не знайшла, тож у список не додала.")
+        lines.append("\nМожна надсилати наступне оголошення.")
         await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML,
                                       disable_web_page_preview=True)
 
