@@ -51,6 +51,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -541,7 +542,13 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     is_edit_reply = reply_to and (reply_to == draft.get("prompt_id") or reply_to in draft.get("preview_ids", []))
 
     # Чернетку вже показали, минуло трохи часу, і прийшло щось нове (не правка) — починаємо нове оголошення
-    if draft.get("prompt_id") and not is_edit_reply and now - draft["last_ts"] > NEW_DRAFT_AFTER_SECONDS:
+    is_media = bool(msg.photo or msg.video)
+    if draft.get("photo_mode") == "replace" and is_media:
+        # «Замінити фото»: перше нове фото прибирає старі, далі — додаємо
+        draft["media"], draft["seen"] = [], set()
+        draft["photo_mode"] = "add"
+    if (draft.get("prompt_id") and not is_edit_reply and not draft.get("photo_mode")
+            and now - draft["last_ts"] > NEW_DRAFT_AFTER_SECONDS):
         await clear_draft_messages(context, msg.chat_id, draft)
         drop_draft(context, user.id)
         draft = get_draft(context, user.id)
@@ -585,6 +592,7 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     draft = get_draft(context, job.user_id)
+    draft["photo_mode"] = None
     await clear_draft_messages(context, job.chat_id, draft)
 
     format_note = None
@@ -641,6 +649,9 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
     buttons = [[
         InlineKeyboardButton("✅ Опублікувати", callback_data="publish"),
         InlineKeyboardButton("❌ Скасувати", callback_data="cancel"),
+    ], [
+        InlineKeyboardButton("➕ Додати фото", callback_data="photos_add"),
+        InlineKeyboardButton("🔄 Замінити фото", callback_data="photos_replace"),
     ]]
     if draft.get("final") and not draft.get("locked"):
         buttons.append([InlineKeyboardButton("📄 Опублікувати оригінал без змін", callback_data="publish_raw")])
@@ -717,6 +728,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Чернетку скасовано. Можна надсилати нове оголошення.")
         return
 
+    if query.data in ("photos_add", "photos_replace"):
+        if not draft:
+            await query.answer("Ця чернетка вже неактуальна", show_alert=True)
+            return
+        draft["photo_mode"] = "add" if query.data == "photos_add" else "replace"
+        await query.answer()
+        await context.bot.send_message(
+            chat_id,
+            "📷 Надішліть фото — " + ("додам їх до цього оголошення." if query.data == "photos_add"
+                                     else "вони замінять усі попередні фото цього оголошення.")
+            + "\nТекст лишиться той самий. Потім я покажу оновлену чернетку.",
+        )
+        return
+
     if query.data in ("publish", "publish_raw"):
         if not draft or (not draft["media"] and not draft["plain"]):
             await query.answer("Ця чернетка вже неактуальна", show_alert=True)
@@ -755,6 +780,86 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       disable_web_page_preview=True)
 
 
+# ── Щотижнева перевірка списку ───────────────────────────────────────────────
+
+REVIEW_EVERY_SECONDS = 7 * 24 * 3600
+REVIEW_PAGE = 40  # кнопок в одному повідомленні
+
+
+def review_keyboard(items: list) -> InlineKeyboardMarkup:
+    rows = []
+    for i in sorted(items, key=lambda x: (x.get("kind", "rent"), x["price"]))[:REVIEW_PAGE]:
+        num = i["url"].rsplit("/", 1)[-1]
+        label = item_label(i)
+        rows.append([InlineKeyboardButton("❌ " + label[:60], callback_data=f"rm:{num}")])
+    rows.append([InlineKeyboardButton("✅ Готово, все актуально", callback_data="review_done")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_review(context, chat_id):
+    state = context.bot_data["state"]
+    state["last_review_ts"] = time.time()
+    await save_state(context)
+    items = state["items"]
+    if not items:
+        await context.bot.send_message(chat_id, "🗓 Щотижнева перевірка: список порожній.")
+        return
+    await context.bot.send_message(
+        chat_id,
+        f"🗓 <b>Щотижнева перевірка списку</b> ({len(items)} об'єктів)\n\n"
+        "Натисніть на об'єкт, який уже зданий чи проданий, — я приберу його зі списку в групі. "
+        "Коли все перевірите — «Готово».",
+        parse_mode=ParseMode.HTML,
+        reply_markup=review_keyboard(items),
+    )
+
+
+async def maybe_weekly_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Бот на безкоштовному Render «спить», тож перевіряємо при будь-якій активності."""
+    state = context.bot_data.get("state")
+    chat_id = storage_chat_id()
+    if not state or not chat_id or context.bot_data.get("review_lock"):
+        return
+    last = state.get("last_review_ts")
+    if last is None:
+        state["last_review_ts"] = time.time()  # перший запуск — відлік з сьогодні
+        return
+    if time.time() - last < REVIEW_EVERY_SECONDS:
+        return
+    context.bot_data["review_lock"] = True
+    try:
+        await send_review(context, chat_id)
+    except Exception as e:
+        logger.warning("review: %s", e)
+    finally:
+        context.bot_data["review_lock"] = False
+
+
+async def on_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(update.effective_user.id):
+        await query.answer("Немає доступу", show_alert=True)
+        return
+    state = context.bot_data["state"]
+    if query.data == "review_done":
+        await query.answer("Дякую!")
+        await query.edit_message_text(
+            f"✅ Перевірку завершено. У списку {len(state['items'])} об'єктів. Наступна — через тиждень."
+        )
+        return
+    num = query.data.split(":", 1)[1]
+    url = post_url(int(num))
+    removed = [i for i in state["items"] if i["url"] == url]
+    state["items"] = [i for i in state["items"] if i["url"] != url]
+    if removed:
+        await save_state(context)
+        await refresh_index(context)
+        await query.answer("Прибрала: " + item_label(removed[0])[:150])
+    else:
+        await query.answer("Вже прибрано")
+    await query.edit_message_reply_markup(review_keyboard(state["items"]))
+
+
 # ── Пости, опубліковані в групі вручну ───────────────────────────────────────
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -788,6 +893,7 @@ HELP = (
     "Команди:\n"
     "/list — список об'єктів\n"
     "/remove 2842 — прибрати об'єкт зі списку (номер поста або посилання)\n"
+    "/review — перевірити список: що вже здано/продано (бот і сам нагадує раз на тиждень)\n"
     "/index — створити закріплений список у групі\n"
     "/format — переписування під ваш шаблон (будь-яка мова → українська)\n"
     "/cancel — скасувати чернетку"
@@ -894,6 +1000,11 @@ async def cmd_resettemplate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_review(context, update.effective_chat.id)
+
+
+@admin_only
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     drop_draft(context, update.effective_user.id)
     await update.effective_message.reply_text("Чернетку скасовано.")
@@ -991,6 +1102,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("template", cmd_template, filters=private))
     app.add_handler(CommandHandler("settemplate", cmd_settemplate, filters=private))
     app.add_handler(CommandHandler("resettemplate", cmd_resettemplate, filters=private))
+    app.add_handler(TypeHandler(Update, maybe_weekly_review), group=-1)
+    app.add_handler(CommandHandler("review", cmd_review, filters=private))
+    app.add_handler(CallbackQueryHandler(on_review_button, pattern=r"^(rm:\d+|review_done)$"))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(
         private & (filters.PHOTO | filters.VIDEO | (filters.TEXT & ~filters.COMMAND)),
