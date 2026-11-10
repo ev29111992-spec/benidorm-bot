@@ -398,6 +398,40 @@ def with_footer(text: str, as_html: bool) -> str:
     return body + "\n\n" + (FOOTER_HTML if as_html else FOOTER_PLAIN)
 
 
+def body_limit() -> int:
+    """Скільки символів може мати текст, щоб разом з контактами влізти в підпис до фото."""
+    return CAPTION_LIMIT - len(FOOTER_PLAIN) - 4
+
+
+def shrink_to_fit(text: str, limit: int) -> str:
+    """Якщо текст задовгий — прибираємо дрібні пункти зі списків (з кінця), поки не влізе."""
+    lines = text.split("\n")
+    def size(ls):
+        return len("\n".join(ls))
+    while size(lines) > limit:
+        # кандидати: пункти списку (не заголовки, не перші 6 рядків, не порожні)
+        cand = [
+            i for i, l in enumerate(lines)
+            if i > 5 and l.strip() and not l.strip().endswith(":") and not l.isupper()
+            and not l.startswith(("📍", "💰", "❗"))
+        ]
+        if not cand:
+            break
+        # блок = група пунктів під одним заголовком; ріжемо з найдовшого блоку
+        blocks, cur = [], []
+        for i in cand:
+            if cur and i != cur[-1] + 1:
+                blocks.append(cur); cur = []
+            cur.append(i)
+        if cur:
+            blocks.append(cur)
+        biggest = max(blocks, key=len)
+        lines.pop(biggest[-1])
+    out = "\n".join(lines)
+    out = re.sub(r"\n[^\n]*:\n(?=\n|$)", "\n", out)  # прибрати заголовок, якщо під ним нічого не лишилось
+    return out[:limit]
+
+
 def get_api_key(context) -> str:
     return os.environ.get("ANTHROPIC_API_KEY") or context.bot_data["state"].get("anthropic_key") or ""
 
@@ -438,6 +472,24 @@ async def format_listing(context, raw: str) -> str:
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
     if not text:
         raise RuntimeError("порожня відповідь")
+    return text
+
+
+async def format_to_fit(context, raw: str) -> str:
+    """Переписує під шаблон і гарантує, що текст влізе в один підпис до фото."""
+    limit = body_limit()
+    text = await format_listing(context, raw)
+    if len(text) > limit:
+        try:
+            text = await format_listing(
+                context,
+                raw + f"\n\n(ВАЖЛИВО: готовий текст має бути НЕ довше {limit - 60} символів — "
+                      "скороти списки, залиш найважливіше.)",
+            )
+        except Exception:
+            pass
+    if len(text) > limit:
+        text = shrink_to_fit(text, limit)
     return text
 
 
@@ -508,7 +560,7 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
     if draft["plain"] and not draft.get("locked") and not draft.get("final"):
         try:
             await context.bot.send_chat_action(job.chat_id, "typing")
-            draft["final"] = await format_listing(context, draft["plain"])
+            draft["final"] = await format_to_fit(context, draft["plain"])
         except RuntimeError as e:
             if str(e) == "no_key":
                 format_note = ("ℹ️ Переписування під шаблон вимкнене: немає ключа Claude API. "
@@ -549,7 +601,13 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
         lines.append("⚠️ Не знайшла ціну в тексті — опублікую, але в список не додам")
     final_len = len(with_footer(draft["final"], False)) if draft.get("final") else len(draft["plain"])
     if draft["media"] and final_len > CAPTION_LIMIT:
-        lines.append("ℹ️ Текст довгий для підпису до фото, тож опублікую його окремим повідомленням під фото")
+        lines.append(
+            f"⚠️ Текст задовгий для підпису до фото на {final_len - CAPTION_LIMIT} симв. "
+            "(ліміт Telegram — 1024). Скоротіть його через «Відповісти», "
+            "інакше опис піде окремим повідомленням під фото."
+        )
+    if len(draft["media"]) > 10:
+        lines.append(f"ℹ️ Фото {len(draft['media'])}, а в одному пості Telegram дозволяє максимум 10 — опублікую перші 10.")
     lines.append("")
     lines.append("Можна ще докинути фото або текст — я оновлю чернетку.")
     if draft.get("final"):
@@ -570,7 +628,7 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
 
 async def publish_draft(context, draft: dict) -> list:
     """Публікує чернетку в групу. Повертає список надісланих повідомлень."""
-    media = draft["media"]
+    media = draft["media"][:10]  # один пост = один альбом, максимум 10 фото
     if draft.get("final") and not draft.get("use_raw"):
         plain = with_footer(draft["final"], as_html=False)
         text_html = with_footer(draft["final"], as_html=True)
@@ -602,13 +660,11 @@ async def publish_draft(context, draft: dict) -> list:
             parse_mode=ParseMode.HTML if fits_caption else None,
         ))
     else:
-        for start in range(0, len(media), 10):  # Telegram: максимум 10 у альбомі
-            chunk = media[start:start + 10]
-            group = [
-                make(k, f, text_html if (start == 0 and i == 0 and fits_caption) else None)
-                for i, (k, f) in enumerate(chunk)
-            ]
-            sent.extend(await context.bot.send_media_group(CHANNEL_ID, group))
+        group = [
+            make(k, f, text_html if (i == 0 and fits_caption) else None)
+            for i, (k, f) in enumerate(media)
+        ]
+        sent.extend(await context.bot.send_media_group(CHANNEL_ID, group))
 
     if plain and not fits_caption:
         sent.append(await context.bot.send_message(
