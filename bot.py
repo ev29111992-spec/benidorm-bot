@@ -35,6 +35,7 @@ import logging
 import asyncio
 
 from aiohttp import web
+import httpx
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -293,6 +294,101 @@ async def add_item(context, parsed: dict, message_id: int) -> dict:
     return item
 
 
+# ── Переписування тексту під шаблон (Claude API) ───────────────────────────
+
+DEFAULT_TEMPLATE = """🏡 ОРЕНДА НА 11 МІСЯЦІВ | АПАРТАМЕНТИ З 1 СПАЛЬНЕЮ
+
+📍 Benidorm, Levante (Іспанія)
+💰 Ціна: 1 100 € / місяць + комунальні платежі
+
+❗️Вільна з 15.12.2026❗️
+
+ХАРАКТЕРИСТИКИ:
+Площа — 70 м²
+1 спальня
+1 санвузол
+Повністю мебльована
+Побутова техніка
+Кухня-вітальня з виходом на простору закриту терасу
+
+УРБАНІЗАЦІЯ:
+Закрита озеленена територія
+Спільний басейн
+Корти для паделу
+Тенісний корт
+Дитячий майданчик
+Тренажерний зал
+
+РОЗТАШУВАННЯ:
+Відстань до моря — 800 м
+Відстань до аеропорту Alicante — 45 км
+
+📞 Контакти для звʼязку:
+📱 Телефон: +34684735652
+💬WhatsApp: Olena_Benidorm
+✈️ Telegram: @Olena_Benidorm
+📸 Instagram:benidorm_rent_sale
+
+Більше об'єктів в каналі: https://t.me/benidorm_rent_sale"""
+
+FORMAT_MODEL = os.environ.get("FORMAT_MODEL", "claude-sonnet-5-5")
+
+FORMAT_RULES = """Ти допомагаєш рієлторці Олені з Бенідорма оформлювати оголошення для її Telegram-групи.
+Тобі дають сирий текст оголошення будь-якою мовою (іспанською, англійською, російською, українською тощо).
+Перепиши його УКРАЇНСЬКОЮ точно за структурою зразка нижче.
+
+Правила:
+- Структура, емодзі, порядок блоків і ВЕЛИКІ ЛІТЕРИ в заголовках — як у зразку.
+- Перший рядок: 🏡 ТИП УГОДИ | ТИП ОБ'ЄКТА З КІЛЬКІСТЮ СПАЛЕНЬ (великими літерами). Тип угоди: «ОРЕНДА НА 11 МІСЯЦІВ», «ДОВГОСТРОКОВА ОРЕНДА», «ЗИМОВА ОРЕНДА», «ПРОДАЖ» — залежно від тексту. Якщо строк оренди не вказано — «ДОВГОСТРОКОВА ОРЕНДА».
+- 📍 Місто, район (Іспанія). Назви міст, районів, ЖК пиши латиницею, як у джерелі (Benidorm, La Cala, Poniente, Finestrat…).
+- 💰 Ціна: числа з пробілом між тисячами (1 100 €, 349 000 €). Для оренди — «€ / місяць», і «+ комунальні платежі», якщо комуналка не включена або не сказано, що включена.
+- Рядок «❗️Вільна з …❗️» додавай, лише якщо в джерелі є дата.
+- Використовуй ТІЛЬКИ факти з джерела. Нічого не вигадуй. Якщо даних для рядка чи блоку немає — пропусти його.
+- Депозит, умови, «можна з тваринами» тощо — коротким окремим блоком «УМОВИ:», якщо вони є в джерелі.
+- Стиль простий і живий, без рекламних слів на кшталт «неймовірний», «розкішний», «унікальна пропозиція».
+- Іспанські терміни можна лишати там, де так природніше (urbanización, trastero, empadronamiento — з українським поясненням у дужках за потреби).
+- Блок контактів наприкінці — ЗАВЖДИ дослівно як у зразку. Чужі телефони, імена агентів, посилання, референс-номери з джерела прибери.
+- Увесь текст — не довше 950 символів.
+- Відповідай ЛИШЕ готовим текстом оголошення, без пояснень."""
+
+
+def get_api_key(context) -> str:
+    return os.environ.get("ANTHROPIC_API_KEY") or context.bot_data["state"].get("anthropic_key") or ""
+
+
+def get_template(context) -> str:
+    return context.bot_data["state"].get("template") or DEFAULT_TEMPLATE
+
+
+async def format_listing(context, raw: str) -> str:
+    key = get_api_key(context)
+    if not key:
+        raise RuntimeError("no_key")
+    system = FORMAT_RULES + "\n\nЗРАЗОК ОФОРМЛЕННЯ:\n" + get_template(context)
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": FORMAT_MODEL,
+                "max_tokens": 1500,
+                "system": system,
+                "messages": [{"role": "user", "content": "Сирий текст оголошення:\n\n" + raw}],
+            },
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"API {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+    if not text:
+        raise RuntimeError("порожня відповідь")
+    return text
+
+
 # ── Чернетка оголошення ───────────────────────────────────────────────────────
 
 def get_draft(context, user_id) -> dict:
@@ -322,7 +418,14 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     text_html = msg.caption_html if (msg.photo or msg.video) else msg.text_html
     text_plain = msg.caption if (msg.photo or msg.video) else msg.text
-    if text_plain and text_plain.strip():
+    reply_to = msg.reply_to_message.message_id if msg.reply_to_message else None
+    if text_plain and text_plain.strip() and reply_to and reply_to in (draft.get("prompt_id"), draft.get("preview_id")):
+        # Олена відповіла на чернетку виправленим текстом — беремо його як є
+        draft["final"] = text_plain.strip()
+        draft["locked"] = True
+    elif text_plain and text_plain.strip():
+        draft["locked"] = False
+        draft["final"] = None
         if draft["plain"]:
             draft["html"] += "\n\n" + text_html
             draft["plain"] += "\n\n" + text_plain
@@ -341,16 +444,42 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     draft = get_draft(context, job.user_id)
-    if draft.get("prompt_id"):
+    for key in ("prompt_id", "preview_id"):
+        if draft.get(key):
+            try:
+                await context.bot.delete_message(job.chat_id, draft[key])
+            except Exception:
+                pass
+            draft[key] = None
+
+    format_note = None
+    if draft["plain"] and not draft.get("locked") and not draft.get("final"):
         try:
-            await context.bot.delete_message(job.chat_id, draft["prompt_id"])
-        except Exception:
-            pass
+            await context.bot.send_chat_action(job.chat_id, "typing")
+            draft["final"] = await format_listing(context, draft["plain"])
+        except RuntimeError as e:
+            if str(e) == "no_key":
+                format_note = ("ℹ️ Переписування під шаблон вимкнене: немає ключа Claude API. "
+                               "Як увімкнути — /format")
+            else:
+                format_note = f"⚠️ Не вдалося переписати текст ({html.escape(str(e)[:150])}) — можна опублікувати оригінал"
+            logger.warning("format: %s", e)
+        except Exception as e:
+            format_note = "⚠️ Не вдалося переписати текст — можна опублікувати оригінал"
+            logger.warning("format: %s", e)
+
+    if draft.get("final"):
+        pv = await context.bot.send_message(job.chat_id, draft["final"], disable_web_page_preview=True)
+        draft["preview_id"] = pv.message_id
 
     n_photo = sum(1 for t, _ in draft["media"] if t == "photo")
     n_video = sum(1 for t, _ in draft["media"] if t == "video")
-    parsed = parse_listing(draft["plain"])
+    parsed = parse_listing(draft.get("final") or draft["plain"])
     lines = ["📝 <b>Чернетка оголошення</b>"]
+    if draft.get("final"):
+        lines.append("☝️ Вище — текст, який піде в групу." + (" (ваша версія)" if draft.get("locked") else ""))
+    if format_note:
+        lines.append(format_note)
     media_bits = []
     if n_photo:
         media_bits.append(f"{n_photo} фото")
@@ -363,15 +492,20 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
         lines.append("У список піде: <b>" + html.escape(item_label(parsed)) + "</b>")
     else:
         lines.append("⚠️ Не знайшла ціну в тексті — опублікую, але в список не додам")
-    if len(draft["media"]) > 1 and len(draft["plain"]) > CAPTION_LIMIT:
+    if draft["media"] and len(draft.get("final") or draft["plain"]) > CAPTION_LIMIT:
         lines.append("ℹ️ Текст довгий для підпису до фото, тож опублікую його окремим повідомленням під фото")
     lines.append("")
     lines.append("Можна ще докинути фото або текст — я оновлю чернетку.")
+    if draft.get("final"):
+        lines.append("Щоб виправити текст: натисніть «Відповісти» на повідомлення з текстом і надішліть виправлену версію.")
 
-    kb = InlineKeyboardMarkup([[
+    buttons = [[
         InlineKeyboardButton("✅ Опублікувати", callback_data="publish"),
         InlineKeyboardButton("❌ Скасувати", callback_data="cancel"),
-    ]])
+    ]]
+    if draft.get("final"):
+        buttons.append([InlineKeyboardButton("📄 Опублікувати оригінал без змін", callback_data="publish_raw")])
+    kb = InlineKeyboardMarkup(buttons)
     m = await context.bot.send_message(
         job.chat_id, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb
     )
@@ -380,7 +514,12 @@ async def show_draft_prompt(context: ContextTypes.DEFAULT_TYPE):
 
 async def publish_draft(context, draft: dict) -> list:
     """Публікує чернетку в групу. Повертає список надісланих повідомлень."""
-    media, text_html, plain = draft["media"], draft["html"], draft["plain"]
+    media = draft["media"]
+    if draft.get("final") and not draft.get("use_raw"):
+        plain = draft["final"]
+        text_html = html.escape(plain)
+    else:
+        text_html, plain = draft["html"], draft["plain"]
     fits_caption = bool(plain) and len(plain) <= CAPTION_LIMIT
     sent = []
 
@@ -437,7 +576,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Чернетку скасовано.")
         return
 
-    if query.data == "publish":
+    if query.data in ("publish", "publish_raw"):
+        if draft:
+            draft["use_raw"] = query.data == "publish_raw"
         if not draft or (not draft["media"] and not draft["plain"]):
             await query.answer("Чернетка порожня", show_alert=True)
             return
@@ -459,7 +600,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         first_id = sent[0].message_id
         lines = [f'✅ Опубліковано: <a href="{post_url(first_id)}">{post_url(first_id)}</a>']
-        parsed = parse_listing(draft["plain"])
+        if draft.get("preview_id"):
+            try:
+                await context.bot.delete_message(query.message.chat_id, draft["preview_id"])
+            except Exception:
+                pass
+        used = draft["plain"] if draft.get("use_raw") or not draft.get("final") else draft["final"]
+        parsed = parse_listing(used)
         if parsed:
             item = await add_item(context, parsed, first_id)
             lines.append("Додано в список: " + html.escape(item_label(item)))
@@ -505,6 +652,7 @@ HELP = (
     "/list — список об'єктів\n"
     "/remove 2842 — прибрати об'єкт зі списку (номер поста або посилання)\n"
     "/index — створити закріплений список у групі\n"
+    "/format — переписування під ваш шаблон (будь-яка мова → українська)\n"
     "/cancel — скасувати чернетку"
 )
 
@@ -527,6 +675,85 @@ def admin_only(func):
 @admin_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(HELP.format(chan=CHANNEL_ID))
+
+
+FORMAT_HELP = (
+    "✍️ <b>Переписування під ваш шаблон</b>\n\n"
+    "Я перекладаю оголошення з будь-якої мови українською і оформлюю за вашим зразком.\n"
+    "Стан: {status}\n\n"
+    "<b>Як увімкнути</b> (один раз):\n"
+    "1. Зайдіть на console.anthropic.com, зареєструйтесь і поповніть баланс (вистачить $5 — "
+    "одне оголошення коштує приблизно 1–2 центи).\n"
+    "2. Розділ API Keys → Create Key → скопіюйте ключ (починається з sk-ant-).\n"
+    "3. Надішліть мені: <code>/setkey ваш_ключ</code>. Я одразу видалю це повідомлення з чату.\n\n"
+    "<b>Шаблон</b>\n"
+    "/template — показати поточний зразок\n"
+    "/settemplate — надішліть цю команду у відповідь (Reply) на повідомлення з новим зразком, "
+    "або <code>/settemplate</code> і текст зразка в тому ж повідомленні\n"
+    "/resettemplate — повернути стандартний зразок"
+)
+
+
+@admin_only
+async def cmd_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = "✅ увімкнено" if get_api_key(context) else "❌ вимкнено (немає ключа)"
+    await update.effective_message.reply_text(
+        FORMAT_HELP.format(status=status), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
+
+
+@admin_only
+async def cmd_setkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    key = (context.args[0].strip() if context.args else "")
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    if not key.startswith("sk-"):
+        await context.bot.send_message(msg.chat_id, "Не схоже на ключ. Він має починатися з sk-ant-… Спробуйте ще раз: /setkey ключ")
+        return
+    context.bot_data["state"]["anthropic_key"] = key
+    try:
+        await format_listing(context, "Оренда квартира 1 спальня Benidorm 900 eur")
+    except Exception as e:
+        context.bot_data["state"].pop("anthropic_key", None)
+        await context.bot.send_message(msg.chat_id, f"⚠️ Ключ не спрацював: {str(e)[:200]}\nПеревірте ключ і баланс на console.anthropic.com")
+        return
+    await save_state(context)
+    await context.bot.send_message(msg.chat_id, "✅ Ключ збережено і перевірено. Тепер я переписуватиму оголошення під ваш шаблон.")
+
+
+@admin_only
+async def cmd_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    custom = bool(context.bot_data["state"].get("template"))
+    await update.effective_message.reply_text(
+        ("Ваш зразок:" if custom else "Стандартний зразок (з вашого оголошення №2842):") + "\n\n" + get_template(context),
+        disable_web_page_preview=True,
+    )
+
+
+@admin_only
+async def cmd_settemplate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = ""
+    if msg.reply_to_message:
+        text = msg.reply_to_message.text or msg.reply_to_message.caption or ""
+    else:
+        text = (msg.text or "").split(None, 1)[1] if len((msg.text or "").split(None, 1)) > 1 else ""
+    if len(text.strip()) < 50:
+        await msg.reply_text("Надішліть /settemplate у відповідь (Reply) на повідомлення зі зразком оголошення.")
+        return
+    context.bot_data["state"]["template"] = text.strip()
+    await save_state(context)
+    await msg.reply_text("✅ Новий зразок збережено. Наступні оголошення оформлюватиму так.")
+
+
+@admin_only
+async def cmd_resettemplate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.bot_data["state"].pop("template", None)
+    await save_state(context)
+    await update.effective_message.reply_text("✅ Повернула стандартний зразок.")
 
 
 @admin_only
@@ -622,6 +849,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("list", cmd_list, filters=private))
     app.add_handler(CommandHandler("remove", cmd_remove, filters=private))
     app.add_handler(CommandHandler("index", cmd_index, filters=private))
+    app.add_handler(CommandHandler("format", cmd_format, filters=private))
+    app.add_handler(CommandHandler("setkey", cmd_setkey, filters=private))
+    app.add_handler(CommandHandler("template", cmd_template, filters=private))
+    app.add_handler(CommandHandler("settemplate", cmd_settemplate, filters=private))
+    app.add_handler(CommandHandler("resettemplate", cmd_resettemplate, filters=private))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(
         private & (filters.PHOTO | filters.VIDEO | (filters.TEXT & ~filters.COMMAND)),
