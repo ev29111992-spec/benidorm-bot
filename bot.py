@@ -19,7 +19,7 @@
 Змінні середовища:
 BOT_TOKEN   — токен від @BotFather
 CHANNEL_ID  — група, напр. @benidorm_rent_sale
-ADMIN_IDS   — Telegram ID тих, кому можна користуватись ботом, через кому
+ADMIN_IDS   — Telegram ID адмінів через кому (якщо не задано — Олена, 289414548)
 PORT        — порт (Render задає сам)
 RENDER_EXTERNAL_URL — адреса сервісу (Render задає сам). Якщо є — працюємо
               через webhook, і Render "будить" бота, коли приходить повідомлення.
@@ -58,7 +58,7 @@ logger = logging.getLogger("benidorm-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "@benidorm_rent_sale")
-ADMIN_IDS = {int(x) for x in re.findall(r"-?\d+", os.environ.get("ADMIN_IDS", ""))}
+ADMIN_IDS = {int(x) for x in re.findall(r"-?\d+", os.environ.get("ADMIN_IDS") or "289414548")}
 PORT = int(os.environ.get("PORT", 8080))
 EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 SEED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed_items.json")
